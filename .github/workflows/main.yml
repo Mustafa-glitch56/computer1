@@ -1,0 +1,195 @@
+# ============================================================================
+#  Put this file at:  .github/workflows/rdp.yml
+#
+#  PUBLIC repo  (strongest: 4 vCPU / 16 GB, free, unlimited minutes)
+#     -> REQUIRED secret: TAILSCALE_AUTHKEY  (Reusable + Ephemeral key)
+#  PRIVATE repo (2 vCPU / 8 GB, ~1000 Windows minutes per month)
+#     -> no secret needed (you log in to Tailscale through a link shown in the log)
+#
+#  Security model:
+#   * Only the repo OWNER can start it (job guard).
+#   * RDP is reachable ONLY from your Tailscale network (firewall + NLA + lockout).
+#   * Password is random for every session, so a leaked log line is useless later.
+# ============================================================================
+
+name: RDP
+
+on:
+  workflow_dispatch:
+    inputs:
+      password:
+        description: "Password (PRIVATE repo only; empty = random)"
+        required: false
+        default: ""
+      apps:
+        description: "Apps to install (Chocolatey names, comma separated, empty = none)"
+        required: false
+        default: "googlechrome,7zip"
+
+jobs:
+  rdp:
+    if: github.actor == github.repository_owner
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      REPO_PRIVATE: ${{ github.event.repository.private }}
+
+    steps:
+      - name: Guard and start clock
+        shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          if ($env:REPO_PRIVATE -ne 'true' -and -not $env:TS_AUTHKEY) {
+            Write-Error "Public repo: add the secret TAILSCALE_AUTHKEY (or use a private repo). A login link in a public log is not safe."
+            exit 1
+          }
+          "START=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $msi = "$env:TEMP\ts.msi"
+          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $msi
+          Start-Process msiexec.exe -ArgumentList "/i","`"$msi`"","/quiet","/norestart" -Wait
+
+      - name: Login to Tailscale
+        shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if ($env:TS_AUTHKEY) {
+            & $ts up --authkey="$env:TS_AUTHKEY" --hostname=gh-pc --unattended --accept-dns=false
+            if ($LASTEXITCODE -ne 0) { Write-Error "Tailscale login failed"; exit 1 }
+          } else {
+            # Private repo without a key: open the link that appears in this log
+            $out = "$env:TEMP\ts-out.txt"; $err = "$env:TEMP\ts-err.txt"
+            function Read-Shared($f) {
+              try {
+                $fs = [IO.File]::Open($f, 'Open', 'Read', 'ReadWrite')
+                $sr = New-Object IO.StreamReader($fs); $t = $sr.ReadToEnd(); $sr.Close(); $t
+              } catch { "" }
+            }
+            $p = Start-Process $ts -ArgumentList "up","--unattended","--hostname=gh-pc","--accept-dns=false" `
+                   -RedirectStandardOutput $out -RedirectStandardError $err -PassThru -NoNewWindow
+            $null = $p.Handle
+            $url = $null
+            for ($i = 0; $i -lt 60 -and -not $url -and -not $p.HasExited; $i++) {
+              Start-Sleep 2
+              $txt = (Read-Shared $out) + (Read-Shared $err)
+              if ($txt -match 'https://login\.tailscale\.com/\S+') { $url = $Matches[0] }
+            }
+            if ($url) {
+              Write-Host ""
+              Write-Host "=========================================================="
+              Write-Host " OPEN THIS LINK AND LOG IN TO TAILSCALE:"
+              Write-Host " $url"
+              Write-Host "=========================================================="
+              Write-Host ""
+            }
+            if (-not $p.WaitForExit(600000)) { Write-Error "Login timed out (10 min)"; exit 1 }
+            if ($p.ExitCode -ne 0) { Write-Error "Tailscale login failed"; exit 1 }
+          }
+
+          $ip = (& $ts ip -4 | Select-Object -First 1)
+          if (-not $ip) { Write-Error "No Tailscale IP"; exit 1 }
+          "RDP_IP=$ip" >> $env:GITHUB_ENV
+
+      - name: Setup RDP, hardening and speed tweaks
+        shell: pwsh
+        env:
+          INPUT_PASS: ${{ inputs.password }}
+        run: |
+          # ---------- Password (random per session; custom only in a private repo) ----------
+          $pass = ""
+          if ($env:REPO_PRIVATE -eq 'true') { $pass = $env:INPUT_PASS }
+          if (-not $pass) {
+            $up  = "ABCDEFGHJKMNPQRSTUVWXYZ".ToCharArray()
+            $lo  = "abcdefghjkmnpqrstuvwxyz".ToCharArray()
+            $dg  = "23456789".ToCharArray()
+            $all = $up + $lo + $dg
+            $chars = @((Get-Random -InputObject $up), (Get-Random -InputObject $lo), (Get-Random -InputObject $dg)) +
+                     (1..12 | ForEach-Object { Get-Random -InputObject $all })
+            $raw  = -join ($chars | Get-Random -Count $chars.Count)
+            $pass = "$($raw.Substring(0,5))-$($raw.Substring(5,5))-$($raw.Substring(10,5))"
+          }
+          "RDP_PASS=$pass" >> $env:GITHUB_ENV
+
+          # ---------- RDP hardening ----------
+          $tsKey = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
+          Set-ItemProperty $tsKey fDenyTSConnections 0
+          Set-ItemProperty "$tsKey\WinStations\RDP-Tcp" UserAuthentication 1          # NLA ON
+          New-NetFirewallRule -DisplayName "RDP-Tailscale-Only" -Direction Inbound -Protocol TCP -LocalPort 3389 `
+            -RemoteAddress 100.64.0.0/10 -Action Allow | Out-Null                      # Tailscale range only
+          net accounts /lockoutthreshold:5 /lockoutduration:30 /lockoutwindow:30 | Out-Null   # anti brute-force
+
+          # ---------- Speed ----------
+          powercfg /setactive SCHEME_MIN                                                # High performance
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change standby-timeout-ac 0
+          Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+          foreach ($s in 'wuauserv','UsoSvc','WSearch','SysMain','DiagTrack') {
+            Stop-Service $s -Force -ErrorAction SilentlyContinue
+            Set-Service  $s -StartupType Disabled -ErrorAction SilentlyContinue
+          }
+          Set-TimeZone "Turkey Standard Time" -ErrorAction SilentlyContinue
+          reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations" /v DWMFRAMEINTERVAL /t REG_DWORD /d 15 /f | Out-Null   # 60 FPS
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v SelectTransport /t REG_DWORD /d 0 /f | Out-Null        # UDP allowed
+
+          # ---------- Comfort: behave like a normal PC ----------
+          reg add "HKLM\SOFTWARE\Microsoft\ServerManager" /v DoNotOpenServerManagerAtLogon /t REG_DWORD /d 1 /f | Out-Null
+          reg add "HKLM\SOFTWARE\Microsoft\Active Setup\Installed Components\{A509B1A7-37EF-4b3f-8CFC-4F3A74704073}" /v IsInstalled /t REG_DWORD /d 0 /f | Out-Null
+          reg add "HKLM\SOFTWARE\Microsoft\Active Setup\Installed Components\{A509B1A8-37EF-4b3f-8CFC-4F3A74704073}" /v IsInstalled /t REG_DWORD /d 0 /f | Out-Null
+
+          # No animations for the new RDP profile
+          reg load HKU\DefUser C:\Users\Default\NTUSER.DAT | Out-Null
+          reg add "HKU\DefUser\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" /v VisualFXSetting /t REG_DWORD /d 2 /f | Out-Null
+          reg add "HKU\DefUser\Control Panel\Desktop" /v UserPreferencesMask /t REG_BINARY /d 9012038010000000 /f | Out-Null
+          reg add "HKU\DefUser\Control Panel\Desktop" /v MenuShowDelay /t REG_SZ /d 0 /f | Out-Null
+          [gc]::Collect(); Start-Sleep 1
+          reg unload HKU\DefUser | Out-Null
+
+          # ---------- User ----------
+          New-LocalUser RDP -Password (ConvertTo-SecureString $pass -AsPlainText -Force) -PasswordNeverExpires | Out-Null
+          Add-LocalGroupMember Administrators RDP
+          Add-LocalGroupMember "Remote Desktop Users" RDP
+          Restart-Service TermService -Force
+
+          Write-Host ""
+          Write-Host "Address: $env:RDP_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $pass"
+          Write-Host ""
+
+      - name: Install apps
+        if: ${{ inputs.apps != '' }}
+        shell: pwsh
+        env:
+          APPS: ${{ inputs.apps }}
+        run: |
+          $list = $env:APPS -split '[,\s]+' | Where-Object { $_ }
+          if ($list) { choco install $list -y --no-progress }
+
+      - name: Connection info (keep alive)
+        shell: pwsh
+        run: |
+          $deadline = [int64]$env:START + (350 * 60)
+          while ($true) {
+            $left = [int](($deadline - [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) / 60)
+            if ($left -le 0) { break }
+            Write-Host ""
+            Write-Host "Address: $env:RDP_IP"
+            Write-Host "Username: RDP"
+            Write-Host "Password: $env:RDP_PASS"
+            Write-Host "Time left: about $left minutes (cancel the workflow to stop earlier)"
+            Start-Sleep -Seconds 300
+          }
+
+      - name: Remove device from Tailscale
+        if: always()
+        shell: pwsh
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (Test-Path $ts) { & $ts logout 2>$null }
